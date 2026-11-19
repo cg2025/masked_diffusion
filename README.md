@@ -2,27 +2,26 @@
 
 Glue code that runs the Kim & Schuster "boxes" task through
 [diffusion-vs-ar](https://github.com/HKUNLP/diffusion-vs-ar) (masked diffusion LM vs autoregressive baseline).
-Both upstream repos are git submodules (pinned commits).
+Both upstream repos are git submodules (pinned commits). A GPU is **optional**: the model is tiny, so CPU works
+(slowly); a single GPU (e.g. a free Colab T4) is much faster.
 
-## One-time setup (cluster)
+## Run it anywhere
 ```bash
-git clone --recursive https://github.com/cg2025/masked_diffusion.git /data/scratch/cgoyal/boxes-diffusion
-cd /data/scratch/cgoyal/boxes-diffusion
-# if already cloned without --recursive:  git submodule update --init
-mkdir -p logs                                   # sbatch --output dir must exist
-bash boxes_mdm/make_env.sh                      # login node: builds .venv (py3.9, torch 1.13.1+cu117)
-source .venv/bin/activate && bash boxes_mdm/setup_boxes.sh   # builds data/boxes_*, patches metric.py, copies scripts
+git clone --recursive https://github.com/cg2025/masked_diffusion.git && cd masked_diffusion
+pip install -r requirements.txt
+QUICK=1 bash boxes_mdm/run_boxes.sh          # sanity run: 4000 train / 500 test examples, 3 epochs
+bash boxes_mdm/run_boxes.sh                  # full run (100 epochs on GPU; set EPOCHS=... on CPU)
+MODE=ar bash boxes_mdm/run_boxes.sh          # autoregressive baseline
 ```
-The Google Drive data from the diffusion-vs-ar README is **not** needed for boxes.
+Colab: open `boxes_colab.ipynb`. `run_boxes.sh` auto-detects CPU / 1 GPU / several GPUs, prepares the data on first run
+(no Google Drive download needed), trains, evaluates and prints accuracy by number of operations.
+Knobs: `MODE EPOCHS MODEL LR BS T MAX_TRAIN MAX_TEST VAL_SIZE NGPU QUICK`.
 
-## Run
-```bash
-sbatch boxes-smoke.sbatch                                            # 2-epoch MDM smoke test, 1 GPU
-cd diffusion-vs-ar && NGPU=8 EPOCHS=100 bash scripts/boxes/train-mdm.sh   # full MDM
-cd diffusion-vs-ar && NGPU=8 EPOCHS=100 bash scripts/boxes/train-sft.sh   # AR baseline
-```
-Results: `python scripts/boxes/score_boxes.py --pred <exp>/boxes_test/generated_predictions.jsonl --meta data/boxes_test.meta.jsonl`
+## What the scripts do
+- `boxes_mdm/setup_boxes.sh`: unzips the boxes data, builds the word-level vocab/configs (`prep_boxes.py`), and applies two idempotent patches to the upstream checkout: `patch_metric.py` (boxes accuracy metric) and `patch_device.py` (removes hardcoded `.cuda()` / NCCL init so CPU and single-GPU work).
+- `boxes_mdm/run_boxes.sh`: train, evaluate and score (`scripts_boxes/score_boxes.py`).
+- `boxes-smoke.sbatch` and `boxes_mdm/make_env.sh`: optional Slurm wrapper / uv environment builder for a cluster.
 
 ## Notes
-- `setup_boxes.sh` and `patch_metric.py` are idempotent; they modify the `diffusion-vs-ar` working tree (shows as dirty submodule). Don't commit the generated data (dataset authors' request).
-- The smoke job excludes node `gpu20-2`, where earlier jobs saw no GPU. Check with `srun --partition=drl-titanrtx --qos=drl-main --account=drl --gres=gpu:1 nvidia-smi -L`.
+- The patches modify the `diffusion-vs-ar` working tree (shows as a dirty submodule). Don't commit the generated data (dataset authors' request).
+- On a cluster, `mkdir -p logs` before `sbatch`, and check GPU allocation with `srun --gres=gpu:1 nvidia-smi -L`. Earlier jobs saw no GPU on node `gpu20-2`, which the sbatch excludes.

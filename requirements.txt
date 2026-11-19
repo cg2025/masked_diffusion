@@ -1,0 +1,9 @@
+# Portable requirements (laptop / Colab / cluster). Install torch for your hardware first if you need a
+# specific CUDA build (https://pytorch.org/get-started/locally/); Colab already has a GPU build.
+# Tested: Python 3.11, torch 2.14 (CPU), numpy 2.2. The pins below are the versions the upstream code expects.
+torch
+transformers==4.37.2
+accelerate==0.27.2
+datasets==2.14.7
+peft==0.6.0
+matplotlib

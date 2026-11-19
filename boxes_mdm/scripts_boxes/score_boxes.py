@@ -7,6 +7,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--pred", required=True)
 ap.add_argument("--meta", required=True)
 ap.add_argument("--tsv", default=None)
+ap.add_argument("--truncate", action="store_true", help="use the first len(pred) meta rows (when run with --max_samples)")
 a = ap.parse_args()
 
 def items(x):
@@ -17,6 +18,7 @@ def items(x):
 
 preds = [json.loads(l) for l in open(a.pred) if l.strip()]
 meta = [json.loads(l) for l in open(a.meta) if l.strip()]
+if a.truncate: meta = meta[:len(preds)]
 assert len(preds) == len(meta), f"{len(preds)} preds vs {len(meta)} meta (use --max_samples consistently)"
 tot, cor = collections.Counter(), collections.Counter()
 rows = []
