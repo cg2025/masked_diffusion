@@ -1,2 +1,0 @@
-cpu-bind=MASK - gpu20-2.drl, task  0  0 [2707991]: mask 0xc000000000c000000000 set
-/var/lib/slurm/slurmd/job3123667/slurm_script: line 23: python: command not found

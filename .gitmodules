@@ -1,0 +1,6 @@
+[submodule "diffusion-vs-ar"]
+	path = diffusion-vs-ar
+	url = https://github.com/HKUNLP/diffusion-vs-ar.git
+[submodule "entity-tracking-lms"]
+	path = entity-tracking-lms
+	url = https://github.com/sebschu/entity-tracking-lms.git

@@ -1,15 +1,17 @@
 # usage: NGPU=8 EPOCHS=100 MODEL=model_config_tiny_boxes LR=1e-3 bash scripts/boxes/train-mdm.sh
+set -e
 export WANDB_DISABLED=true
 NGPU=${NGPU:-8}; EPOCHS=${EPOCHS:-100}; MODEL=${MODEL:-model_config_tiny_boxes}; LR=${LR:-1e-3}
 BS=${BS:-128}; T=${T:-20}
 CUT=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['cutoff_len'])")
 GPUS=$(seq -s, 0 $((NGPU-1)))
+MG=""; [ "$NGPU" -gt 1 ] && MG="--multi_gpu"   # --multi_gpu with a single process can fail
 
 exp=output/boxes/mdm-alpha0.25-gamma1-bs$((BS*NGPU))-lr$LR-ep$EPOCHS-T$T-`date "+%Y%m%d-%H%M%S"`
 mkdir -p $exp
 
 CUDA_VISIBLE_DEVICES=$GPUS \
-accelerate launch --multi_gpu --num_machines 1 --mixed_precision fp16 --num_processes $NGPU --main_process_port 20099 \
+accelerate launch $MG --num_machines 1 --mixed_precision fp16 --num_processes $NGPU --main_process_port 20099 \
 src/train_bash.py \
     --stage mdm --overwrite_output_dir \
     --cache_dir ./cache \
