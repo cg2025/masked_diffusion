@@ -1,0 +1,1012 @@
+From 38b7a4be5024a3f942f73152877498f9539cbb82 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 03:57:07 +0000
+Subject: [PATCH 1/2] Fix setup: register submodules, GPU request, venv
+ bootstrap, idempotent patch, README
+
+---
+ .gitignore                           |   5 ++++
+ .gitmodules                          |   6 +++++
+ README.md                            |  28 +++++++++++++++++++++
+ boxes-smoke.sbatch                   |  35 ++++++++++++++++-----------
+ boxes_mdm.tar.gz                     | Bin 4369 -> 0 bytes
+ boxes_mdm/make_env.sh                |  13 ++++++++++
+ boxes_mdm/patch_metric.py            |   8 ++++--
+ boxes_mdm/scripts_boxes/train-mdm.sh |   4 ++-
+ boxes_mdm/scripts_boxes/train-sft.sh |   4 ++-
+ boxes_mdm/setup_boxes.sh             |  28 ++++++++++++++-------
+ logs/boxes-smoke-3123667.err         |   2 --
+ logs/boxes-smoke-3123667.out         |   0
+ logs/boxes-smoke-3123698.err         |  10 --------
+ logs/boxes-smoke-3123698.out         |   0
+ logs/boxes-smoke-3123699.err         |   1 -
+ logs/boxes-smoke-3123699.out         |   7 ------
+ 16 files changed, 104 insertions(+), 47 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 .gitmodules
+ create mode 100644 README.md
+ delete mode 100644 boxes_mdm.tar.gz
+ create mode 100755 boxes_mdm/make_env.sh
+ delete mode 100644 logs/boxes-smoke-3123667.err
+ delete mode 100644 logs/boxes-smoke-3123667.out
+ delete mode 100644 logs/boxes-smoke-3123698.err
+ delete mode 100644 logs/boxes-smoke-3123698.out
+ delete mode 100644 logs/boxes-smoke-3123699.err
+ delete mode 100644 logs/boxes-smoke-3123699.out
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..3c2fe35
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++logs/
++output/
++*.tar.gz
++__pycache__/
++.venv/
+diff --git a/.gitmodules b/.gitmodules
+new file mode 100644
+index 0000000..569a28d
+--- /dev/null
++++ b/.gitmodules
+@@ -0,0 +1,6 @@
++[submodule "diffusion-vs-ar"]
++	path = diffusion-vs-ar
++	url = https://github.com/HKUNLP/diffusion-vs-ar.git
++[submodule "entity-tracking-lms"]
++	path = entity-tracking-lms
++	url = https://github.com/sebschu/entity-tracking-lms.git
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..1477db8
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,28 @@
++# masked_diffusion: boxes entity tracking, MDM vs AR
++
++Glue code that runs the Kim & Schuster "boxes" task through
++[diffusion-vs-ar](https://github.com/HKUNLP/diffusion-vs-ar) (masked diffusion LM vs autoregressive baseline).
++Both upstream repos are git submodules (pinned commits).
++
++## One-time setup (cluster)
++```bash
++git clone --recursive https://github.com/cg2025/masked_diffusion.git /data/scratch/cgoyal/boxes-diffusion
++cd /data/scratch/cgoyal/boxes-diffusion
++# if already cloned without --recursive:  git submodule update --init
++mkdir -p logs                                   # sbatch --output dir must exist
++bash boxes_mdm/make_env.sh                      # login node: builds .venv (py3.9, torch 1.13.1+cu117)
++source .venv/bin/activate && bash boxes_mdm/setup_boxes.sh   # builds data/boxes_*, patches metric.py, copies scripts
++```
++The Google Drive data from the diffusion-vs-ar README is **not** needed for boxes.
++
++## Run
++```bash
++sbatch boxes-smoke.sbatch                                            # 2-epoch MDM smoke test, 1 GPU
++cd diffusion-vs-ar && NGPU=8 EPOCHS=100 bash scripts/boxes/train-mdm.sh   # full MDM
++cd diffusion-vs-ar && NGPU=8 EPOCHS=100 bash scripts/boxes/train-sft.sh   # AR baseline
++```
++Results: `python scripts/boxes/score_boxes.py --pred <exp>/boxes_test/generated_predictions.jsonl --meta data/boxes_test.meta.jsonl`
++
++## Notes
++- `setup_boxes.sh` and `patch_metric.py` are idempotent; they modify the `diffusion-vs-ar` working tree (shows as dirty submodule). Don't commit the generated data (dataset authors' request).
++- The smoke job excludes node `gpu20-2`, where earlier jobs saw no GPU. Check with `srun --partition=drl-titanrtx --qos=drl-main --account=drl --gres=gpu:1 nvidia-smi -L`.
+diff --git a/boxes-smoke.sbatch b/boxes-smoke.sbatch
+index 783aad3..b6a7a03 100644
+--- a/boxes-smoke.sbatch
++++ b/boxes-smoke.sbatch
+@@ -5,31 +5,38 @@
+ #SBATCH --account=drl
+ #SBATCH --nodes=1
+ #SBATCH --ntasks=1
+-#SBATCH --gpus-per-task=1
++#SBATCH --gres=gpu:1
+ #SBATCH --cpus-per-task=4
+ #SBATCH --mem=32G
+ #SBATCH --time=02:00:00
++# All 3 earlier jobs landed on gpu20-2 and saw no GPU there; remove this line once that node is fixed.
++#SBATCH --exclude=gpu20-2
++# NOTE: the logs/ directory must already exist or the job dies silently.
+ #SBATCH --output=/data/scratch/cgoyal/boxes-diffusion/logs/%x-%j.out
+ #SBATCH --error=/data/scratch/cgoyal/boxes-diffusion/logs/%x-%j.err
+ 
+ set -uo pipefail
++ROOT=${ROOT:-/data/scratch/cgoyal/boxes-diffusion}
+ 
+-echo "host=$(hostname)  CUDA_VISIBLE_DEVICES=[${CUDA_VISIBLE_DEVICES-unset}]  SLURM_GPUS_PER_TASK=[${SLURM_GPUS_PER_TASK-unset}]"
+-echo "--- before env.sh ---"; nvidia-smi -L || echo "nvidia-smi failed"
++echo "host=$(hostname)  CUDA_VISIBLE_DEVICES=[${CUDA_VISIBLE_DEVICES-unset}]  SLURM_JOB_GPUS=[${SLURM_JOB_GPUS-unset}]"
++nvidia-smi -L || { echo "NO GPU on this node (nvidia-smi failed) - stopping"; exit 1; }
+ 
+-source /data/scratch/cgoyal/env.sh
+-source /data/scratch/cgoyal/boxes-diffusion/.venv/bin/activate
++[ -f /data/scratch/cgoyal/env.sh ] && source /data/scratch/cgoyal/env.sh
+ export TMPDIR=/data/scratch/cgoyal/tmp
+ export UV_PYTHON_INSTALL_DIR=/data/scratch/cgoyal/uv-python
+-mkdir -p $TMPDIR
++mkdir -p "$TMPDIR"
+ 
+-echo "--- after env.sh ---  CUDA_VISIBLE_DEVICES=[${CUDA_VISIBLE_DEVICES-unset}]"
+-nvidia-smi -L || echo "nvidia-smi failed"
+-python - <<'PY'
+-import torch
+-print(torch.__version__, "cuda available:", torch.cuda.is_available(), "count:", torch.cuda.device_count())
+-PY
+-python -c "import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" || { echo "NO GPU VISIBLE - stopping"; exit 1; }
++[ -f "$ROOT/.venv/bin/activate" ] || { echo "venv missing at $ROOT/.venv - run boxes_mdm/make_env.sh on a login node first"; exit 1; }
++source "$ROOT/.venv/bin/activate"
++command -v python >/dev/null || { echo "python not found after activating venv"; exit 1; }
+ 
+-cd /data/scratch/cgoyal/boxes-diffusion/diffusion-vs-ar
++python -c "import torch,sys; print(torch.__version__, 'cuda available:', torch.cuda.is_available(), 'count:', torch.cuda.device_count()); sys.exit(0 if torch.cuda.is_available() else 1)" \
++    || { echo "torch cannot see the GPU - stopping"; exit 1; }
++
++cd "$ROOT" || exit 1
++[ -f diffusion-vs-ar/src/train_bash.py ] || { echo "submodules missing: run 'git submodule update --init' in $ROOT"; exit 1; }
++# one-time data prep (idempotent)
++[ -f diffusion-vs-ar/data/boxes_lengths.json ] || bash boxes_mdm/setup_boxes.sh || exit 1
++
++cd diffusion-vs-ar
+ NGPU=1 EPOCHS=2 bash scripts/boxes/train-mdm.sh
+diff --git a/boxes_mdm.tar.gz b/boxes_mdm.tar.gz
+deleted file mode 100644
+index 9cc74ac69b92b5ddfa149b72fab6d2d7450997a1..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 4369
+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
+L5ypaH08jt`$56N|
+
+diff --git a/boxes_mdm/make_env.sh b/boxes_mdm/make_env.sh
+new file mode 100755
+index 0000000..85c10f4
+--- /dev/null
++++ b/boxes_mdm/make_env.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++# Build the venv the sbatch expects. Run once on a login node (needs internet), NOT inside the job.
++# usage: ROOT=/data/scratch/cgoyal/boxes-diffusion bash boxes_mdm/make_env.sh
++set -euo pipefail
++ROOT=${ROOT:-/data/scratch/cgoyal/boxes-diffusion}
++export TMPDIR=${TMPDIR:-/data/scratch/cgoyal/tmp}
++export UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR:-/data/scratch/cgoyal/uv-python}
++mkdir -p "$TMPDIR"
++command -v uv >/dev/null || { echo "uv not found: pip install --user uv  (or use conda create -n diffusion python=3.9)"; exit 1; }
++uv venv --python 3.9 "$ROOT/.venv"
++uv pip install -p "$ROOT/.venv/bin/python" -r "$ROOT/diffusion-vs-ar/requirements.txt" \
++    -f https://download.pytorch.org/whl/torch_stable.html
++"$ROOT/.venv/bin/python" -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__)"
+diff --git a/boxes_mdm/patch_metric.py b/boxes_mdm/patch_metric.py
+index ca5bf98..fe57703 100644
+--- a/boxes_mdm/patch_metric.py
++++ b/boxes_mdm/patch_metric.py
+@@ -1,7 +1,11 @@
+-# usage: python patch_metric.py ~/diffusion-vs-ar
++# usage: python patch_metric.py <path to diffusion-vs-ar>
++# Idempotent: safe to run more than once.
+ import sys
+ p = sys.argv[1] + "/src/llmtuner/tuner/core/metric.py"
+ s = open(p).read()
++if "elif 'boxes' in data_name" in s:
++    print("already patched", p)
++    sys.exit(0)
+ old = "        elif 'path' in data_name:\n"
+ new = '''        elif 'boxes' in data_name:  ## Kim & Schuster entity tracking: exact set match of box contents
+             def _items(x):
+@@ -15,6 +19,6 @@ new = '''        elif 'boxes' in data_name:  ## Kim & Schuster entity tracking:
+             score_dict["acc"].append(_p is not None and _p == _l)
+ 
+ '''
+-assert s.count(old) == 1 and "'boxes'" not in s, "already patched or unexpected file"
++assert s.count(old) == 1, "unexpected metric.py layout (upstream changed?)"
+ open(p, "w").write(s.replace(old, new + old))
+ print("patched", p)
+diff --git a/boxes_mdm/scripts_boxes/train-mdm.sh b/boxes_mdm/scripts_boxes/train-mdm.sh
+index a1941c4..da7f886 100644
+--- a/boxes_mdm/scripts_boxes/train-mdm.sh
++++ b/boxes_mdm/scripts_boxes/train-mdm.sh
+@@ -1,15 +1,17 @@
+ # usage: NGPU=8 EPOCHS=100 MODEL=model_config_tiny_boxes LR=1e-3 bash scripts/boxes/train-mdm.sh
++set -e
+ export WANDB_DISABLED=true
+ NGPU=${NGPU:-8}; EPOCHS=${EPOCHS:-100}; MODEL=${MODEL:-model_config_tiny_boxes}; LR=${LR:-1e-3}
+ BS=${BS:-128}; T=${T:-20}
+ CUT=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['cutoff_len'])")
+ GPUS=$(seq -s, 0 $((NGPU-1)))
++MG=""; [ "$NGPU" -gt 1 ] && MG="--multi_gpu"   # --multi_gpu with a single process can fail
+ 
+ exp=output/boxes/mdm-alpha0.25-gamma1-bs$((BS*NGPU))-lr$LR-ep$EPOCHS-T$T-`date "+%Y%m%d-%H%M%S"`
+ mkdir -p $exp
+ 
+ CUDA_VISIBLE_DEVICES=$GPUS \
+-accelerate launch --multi_gpu --num_machines 1 --mixed_precision fp16 --num_processes $NGPU --main_process_port 20099 \
++accelerate launch $MG --num_machines 1 --mixed_precision fp16 --num_processes $NGPU --main_process_port 20099 \
+ src/train_bash.py \
+     --stage mdm --overwrite_output_dir \
+     --cache_dir ./cache \
+diff --git a/boxes_mdm/scripts_boxes/train-sft.sh b/boxes_mdm/scripts_boxes/train-sft.sh
+index 2a35341..1ca1e16 100644
+--- a/boxes_mdm/scripts_boxes/train-sft.sh
++++ b/boxes_mdm/scripts_boxes/train-sft.sh
+@@ -1,15 +1,17 @@
+ # AR baseline. usage: NGPU=8 EPOCHS=100 MODEL=model_config_tiny_boxes LR=1e-3 bash scripts/boxes/train-sft.sh
++set -e
+ export WANDB_DISABLED=true
+ NGPU=${NGPU:-8}; EPOCHS=${EPOCHS:-100}; MODEL=${MODEL:-model_config_tiny_boxes}; LR=${LR:-1e-3}; BS=${BS:-128}
+ CUT=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['cutoff_len'])")
+ NEW=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['max_new_tokens'])")
+ GPUS=$(seq -s, 0 $((NGPU-1)))
++MG=""; [ "$NGPU" -gt 1 ] && MG="--multi_gpu"   # --multi_gpu with a single process can fail
+ 
+ exp=output/boxes/ar-bs$((BS*NGPU))-lr$LR-ep$EPOCHS-`date "+%Y%m%d-%H%M%S"`
+ mkdir -p $exp
+ 
+ CUDA_VISIBLE_DEVICES=$GPUS \
+-accelerate launch --multi_gpu --num_machines 1 --mixed_precision fp16 --num_processes $NGPU \
++accelerate launch $MG --num_machines 1 --mixed_precision fp16 --num_processes $NGPU \
+ src/train_bash.py \
+     --stage sft --overwrite_output_dir \
+     --cache_dir ./cache \
+diff --git a/boxes_mdm/setup_boxes.sh b/boxes_mdm/setup_boxes.sh
+index 216f2c4..d5c8092 100755
+--- a/boxes_mdm/setup_boxes.sh
++++ b/boxes_mdm/setup_boxes.sh
+@@ -1,13 +1,23 @@
+ #!/usr/bin/env bash
+-# usage: bash setup_boxes.sh [REPO=~/diffusion-vs-ar] [KS_REPO=~/entity-tracking-lms] [SPLIT=t5_boxes_nso_exp2_max3]
+-# Run AFTER downloading the diffusion-vs-ar data (Google Drive link in its README) into $REPO/data.
++# usage: bash boxes_mdm/setup_boxes.sh [REPO] [KS_REPO] [SPLIT]
++# Defaults: the diffusion-vs-ar / entity-tracking-lms submodules next to boxes_mdm/.
++# Needs: submodules checked out (git submodule update --init), `unzip`, and the project venv
++# active (prep_boxes.py imports transformers). The Google Drive data from the diffusion-vs-ar
++# README is NOT needed for boxes: prep_boxes.py creates data/dataset_info.json itself.
+ set -euo pipefail
+ HERE=$(cd "$(dirname "$0")" && pwd)
+-REPO=${1:-$HOME/diffusion-vs-ar}; KS=${2:-$HOME/entity-tracking-lms}; SPLIT=${3:-t5_boxes_nso_exp2_max3}
+-TMP=${TMPDIR:-/tmp}/boxes_$USER; mkdir -p $TMP      # keep unzipped data OUT of any git repo (authors' request)
+-unzip -oq -P iamnotaLM $KS/data/boxes-dataset-v1.zip -d $TMP
+-python $HERE/prep_boxes.py --boxes_dir $TMP/boxes-dataset-v1 --repo $REPO --split $SPLIT
+-python $HERE/patch_metric.py $REPO
+-mkdir -p $REPO/scripts/boxes
+-cp $HERE/scripts_boxes/* $REPO/scripts/boxes/
++ROOT=$(cd "$HERE/.." && pwd)
++REPO=${1:-$ROOT/diffusion-vs-ar}; KS=${2:-$ROOT/entity-tracking-lms}; SPLIT=${3:-t5_boxes_nso_exp2_max3}
++
++[ -f "$REPO/src/train_bash.py" ] || { echo "ERROR: $REPO is empty/not diffusion-vs-ar. Run: git submodule update --init"; exit 1; }
++[ -f "$KS/data/boxes-dataset-v1.zip" ] || { echo "ERROR: $KS/data/boxes-dataset-v1.zip missing. Run: git submodule update --init"; exit 1; }
++command -v unzip >/dev/null || { echo "ERROR: unzip not found"; exit 1; }
++python -c "import transformers" 2>/dev/null || { echo "ERROR: transformers not importable; activate the venv (see make_env.sh)"; exit 1; }
++
++TMP=${TMPDIR:-/tmp}/boxes_$(id -un); mkdir -p "$TMP"   # keep unzipped data OUT of any git repo (authors' request)
++unzip -oq -P iamnotaLM "$KS/data/boxes-dataset-v1.zip" -d "$TMP"
++python "$HERE/prep_boxes.py" --boxes_dir "$TMP/boxes-dataset-v1" --repo "$REPO" --split "$SPLIT"
++python "$HERE/patch_metric.py" "$REPO"
++mkdir -p "$REPO/scripts/boxes"
++cp "$HERE"/scripts_boxes/* "$REPO/scripts/boxes/"
+ echo "ready. smoke test:  cd $REPO && NGPU=1 EPOCHS=2 bash scripts/boxes/train-mdm.sh"
+diff --git a/logs/boxes-smoke-3123667.err b/logs/boxes-smoke-3123667.err
+deleted file mode 100644
+index 5922272..0000000
+--- a/logs/boxes-smoke-3123667.err
++++ /dev/null
+@@ -1,2 +0,0 @@
+-cpu-bind=MASK - gpu20-2.drl, task  0  0 [2707991]: mask 0xc000000000c000000000 set
+-/var/lib/slurm/slurmd/job3123667/slurm_script: line 23: python: command not found
+diff --git a/logs/boxes-smoke-3123667.out b/logs/boxes-smoke-3123667.out
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/logs/boxes-smoke-3123698.err b/logs/boxes-smoke-3123698.err
+deleted file mode 100644
+index 4ac17a9..0000000
+--- a/logs/boxes-smoke-3123698.err
++++ /dev/null
+@@ -1,10 +0,0 @@
+-cpu-bind=MASK - gpu20-2.drl, task  0  0 [2710018]: mask 0xc000000000c000000000 set
+-Traceback (most recent call last):
+-  File "<string>", line 1, in <module>
+-  File "/data/scratch/cgoyal/boxes-diffusion/.venv/lib/python3.9/site-packages/torch/cuda/__init__.py", line 341, in get_device_name
+-    return get_device_properties(device).name
+-  File "/data/scratch/cgoyal/boxes-diffusion/.venv/lib/python3.9/site-packages/torch/cuda/__init__.py", line 371, in get_device_properties
+-    _lazy_init()  # will define _get_device_properties
+-  File "/data/scratch/cgoyal/boxes-diffusion/.venv/lib/python3.9/site-packages/torch/cuda/__init__.py", line 229, in _lazy_init
+-    torch._C._cuda_init()
+-RuntimeError: No CUDA GPUs are available
+diff --git a/logs/boxes-smoke-3123698.out b/logs/boxes-smoke-3123698.out
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/logs/boxes-smoke-3123699.err b/logs/boxes-smoke-3123699.err
+deleted file mode 100644
+index d182d73..0000000
+--- a/logs/boxes-smoke-3123699.err
++++ /dev/null
+@@ -1 +0,0 @@
+-cpu-bind=MASK - gpu20-2.drl, task  0  0 [2710825]: mask 0xc000000000c000000000 set
+diff --git a/logs/boxes-smoke-3123699.out b/logs/boxes-smoke-3123699.out
+deleted file mode 100644
+index 026769a..0000000
+--- a/logs/boxes-smoke-3123699.out
++++ /dev/null
+@@ -1,7 +0,0 @@
+-host=gpu20-2.drl.csail.mit.edu  CUDA_VISIBLE_DEVICES=[0]  SLURM_GPUS_PER_TASK=[unset]
+---- before env.sh ---
+-No devices found.
+---- after env.sh ---  CUDA_VISIBLE_DEVICES=[0]
+-No devices found.
+-1.13.1+cu117 cuda available: False count: 0
+-NO GPU VISIBLE - stopping
+-- 
+2.43.0
+
+
+From 2579ad6f44bfa7ccc07bfe610db2d78da30bbe9a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 04:26:56 +0000
+Subject: [PATCH 2/2] Portable runner: CPU/1-GPU/multi-GPU, Colab notebook,
+ device patch, simplified sbatch
+
+---
+ README.md                              |  35 ++++----
+ boxes-smoke.sbatch                     |  29 ++-----
+ boxes_colab.ipynb                      | 112 +++++++++++++++++++++++++
+ boxes_mdm/patch_device.py              |  34 ++++++++
+ boxes_mdm/run_boxes.sh                 |  86 +++++++++++++++++++
+ boxes_mdm/scripts_boxes/score_boxes.py |   2 +
+ boxes_mdm/scripts_boxes/train-mdm.sh   |  72 ----------------
+ boxes_mdm/scripts_boxes/train-sft.sh   |  62 --------------
+ boxes_mdm/setup_boxes.sh               |   9 +-
+ requirements.txt                       |   9 ++
+ 10 files changed, 271 insertions(+), 179 deletions(-)
+ create mode 100644 boxes_colab.ipynb
+ create mode 100644 boxes_mdm/patch_device.py
+ create mode 100755 boxes_mdm/run_boxes.sh
+ delete mode 100644 boxes_mdm/scripts_boxes/train-mdm.sh
+ delete mode 100644 boxes_mdm/scripts_boxes/train-sft.sh
+ create mode 100644 requirements.txt
+
+diff --git a/README.md b/README.md
+index 1477db8..c52ac74 100644
+--- a/README.md
++++ b/README.md
+@@ -2,27 +2,26 @@
+ 
+ Glue code that runs the Kim & Schuster "boxes" task through
+ [diffusion-vs-ar](https://github.com/HKUNLP/diffusion-vs-ar) (masked diffusion LM vs autoregressive baseline).
+-Both upstream repos are git submodules (pinned commits).
++Both upstream repos are git submodules (pinned commits). A GPU is **optional**: the model is tiny, so CPU works
++(slowly); a single GPU (e.g. a free Colab T4) is much faster.
+ 
+-## One-time setup (cluster)
++## Run it anywhere
+ ```bash
+-git clone --recursive https://github.com/cg2025/masked_diffusion.git /data/scratch/cgoyal/boxes-diffusion
+-cd /data/scratch/cgoyal/boxes-diffusion
+-# if already cloned without --recursive:  git submodule update --init
+-mkdir -p logs                                   # sbatch --output dir must exist
+-bash boxes_mdm/make_env.sh                      # login node: builds .venv (py3.9, torch 1.13.1+cu117)
+-source .venv/bin/activate && bash boxes_mdm/setup_boxes.sh   # builds data/boxes_*, patches metric.py, copies scripts
++git clone --recursive https://github.com/cg2025/masked_diffusion.git && cd masked_diffusion
++pip install -r requirements.txt
++QUICK=1 bash boxes_mdm/run_boxes.sh          # sanity run: 4000 train / 500 test examples, 3 epochs
++bash boxes_mdm/run_boxes.sh                  # full run (100 epochs on GPU; set EPOCHS=... on CPU)
++MODE=ar bash boxes_mdm/run_boxes.sh          # autoregressive baseline
+ ```
+-The Google Drive data from the diffusion-vs-ar README is **not** needed for boxes.
++Colab: open `boxes_colab.ipynb`. `run_boxes.sh` auto-detects CPU / 1 GPU / several GPUs, prepares the data on first run
++(no Google Drive download needed), trains, evaluates and prints accuracy by number of operations.
++Knobs: `MODE EPOCHS MODEL LR BS T MAX_TRAIN MAX_TEST VAL_SIZE NGPU QUICK`.
+ 
+-## Run
+-```bash
+-sbatch boxes-smoke.sbatch                                            # 2-epoch MDM smoke test, 1 GPU
+-cd diffusion-vs-ar && NGPU=8 EPOCHS=100 bash scripts/boxes/train-mdm.sh   # full MDM
+-cd diffusion-vs-ar && NGPU=8 EPOCHS=100 bash scripts/boxes/train-sft.sh   # AR baseline
+-```
+-Results: `python scripts/boxes/score_boxes.py --pred <exp>/boxes_test/generated_predictions.jsonl --meta data/boxes_test.meta.jsonl`
++## What the scripts do
++- `boxes_mdm/setup_boxes.sh`: unzips the boxes data, builds the word-level vocab/configs (`prep_boxes.py`), and applies two idempotent patches to the upstream checkout: `patch_metric.py` (boxes accuracy metric) and `patch_device.py` (removes hardcoded `.cuda()` / NCCL init so CPU and single-GPU work).
++- `boxes_mdm/run_boxes.sh`: train, evaluate and score (`scripts_boxes/score_boxes.py`).
++- `boxes-smoke.sbatch` and `boxes_mdm/make_env.sh`: optional Slurm wrapper / uv environment builder for a cluster.
+ 
+ ## Notes
+-- `setup_boxes.sh` and `patch_metric.py` are idempotent; they modify the `diffusion-vs-ar` working tree (shows as dirty submodule). Don't commit the generated data (dataset authors' request).
+-- The smoke job excludes node `gpu20-2`, where earlier jobs saw no GPU. Check with `srun --partition=drl-titanrtx --qos=drl-main --account=drl --gres=gpu:1 nvidia-smi -L`.
++- The patches modify the `diffusion-vs-ar` working tree (shows as a dirty submodule). Don't commit the generated data (dataset authors' request).
++- On a cluster, `mkdir -p logs` before `sbatch`, and check GPU allocation with `srun --gres=gpu:1 nvidia-smi -L`. Earlier jobs saw no GPU on node `gpu20-2`, which the sbatch excludes.
+diff --git a/boxes-smoke.sbatch b/boxes-smoke.sbatch
+index b6a7a03..59aa93f 100644
+--- a/boxes-smoke.sbatch
++++ b/boxes-smoke.sbatch
+@@ -1,4 +1,5 @@
+ #!/bin/bash
++# Cluster wrapper around the portable runner. Everything real lives in boxes_mdm/run_boxes.sh.
+ #SBATCH --job-name=boxes-smoke
+ #SBATCH --partition=drl-titanrtx
+ #SBATCH --qos=drl-main
+@@ -11,32 +12,14 @@
+ #SBATCH --time=02:00:00
+ # All 3 earlier jobs landed on gpu20-2 and saw no GPU there; remove this line once that node is fixed.
+ #SBATCH --exclude=gpu20-2
+-# NOTE: the logs/ directory must already exist or the job dies silently.
++# The logs/ directory must already exist (mkdir -p logs) or the job dies silently.
+ #SBATCH --output=/data/scratch/cgoyal/boxes-diffusion/logs/%x-%j.out
+ #SBATCH --error=/data/scratch/cgoyal/boxes-diffusion/logs/%x-%j.err
+-
+ set -uo pipefail
+ ROOT=${ROOT:-/data/scratch/cgoyal/boxes-diffusion}
+-
+-echo "host=$(hostname)  CUDA_VISIBLE_DEVICES=[${CUDA_VISIBLE_DEVICES-unset}]  SLURM_JOB_GPUS=[${SLURM_JOB_GPUS-unset}]"
+-nvidia-smi -L || { echo "NO GPU on this node (nvidia-smi failed) - stopping"; exit 1; }
+-
++nvidia-smi -L || { echo "NO GPU on this node - stopping"; exit 1; }
+ [ -f /data/scratch/cgoyal/env.sh ] && source /data/scratch/cgoyal/env.sh
+-export TMPDIR=/data/scratch/cgoyal/tmp
+-export UV_PYTHON_INSTALL_DIR=/data/scratch/cgoyal/uv-python
+-mkdir -p "$TMPDIR"
+-
+-[ -f "$ROOT/.venv/bin/activate" ] || { echo "venv missing at $ROOT/.venv - run boxes_mdm/make_env.sh on a login node first"; exit 1; }
++export TMPDIR=/data/scratch/cgoyal/tmp; mkdir -p "$TMPDIR"
++[ -f "$ROOT/.venv/bin/activate" ] || { echo "venv missing: run boxes_mdm/make_env.sh (or pip install -r requirements.txt in your own env)"; exit 1; }
+ source "$ROOT/.venv/bin/activate"
+-command -v python >/dev/null || { echo "python not found after activating venv"; exit 1; }
+-
+-python -c "import torch,sys; print(torch.__version__, 'cuda available:', torch.cuda.is_available(), 'count:', torch.cuda.device_count()); sys.exit(0 if torch.cuda.is_available() else 1)" \
+-    || { echo "torch cannot see the GPU - stopping"; exit 1; }
+-
+-cd "$ROOT" || exit 1
+-[ -f diffusion-vs-ar/src/train_bash.py ] || { echo "submodules missing: run 'git submodule update --init' in $ROOT"; exit 1; }
+-# one-time data prep (idempotent)
+-[ -f diffusion-vs-ar/data/boxes_lengths.json ] || bash boxes_mdm/setup_boxes.sh || exit 1
+-
+-cd diffusion-vs-ar
+-NGPU=1 EPOCHS=2 bash scripts/boxes/train-mdm.sh
++cd "$ROOT" && EPOCHS=2 bash boxes_mdm/run_boxes.sh
+diff --git a/boxes_colab.ipynb b/boxes_colab.ipynb
+new file mode 100644
+index 0000000..940b856
+--- /dev/null
++++ b/boxes_colab.ipynb
+@@ -0,0 +1,112 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Masked diffusion vs AR on the boxes task\n",
++    "Runs anywhere: Colab (GPU recommended: *Runtime > Change runtime type > T4 GPU*), a laptop (CPU), or a cluster.\n",
++    "The quick run below takes a few minutes on a GPU and is slow but works on CPU."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "REPO_URL = \"https://github.com/cg2025/masked_diffusion.git\"   # must contain the portable-runner changes\n",
++    "!git clone --recursive $REPO_URL /content/masked_diffusion\n",
++    "%cd /content/masked_diffusion"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "!pip install -q -r requirements.txt"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "If pip changed core packages, **restart the runtime** (Runtime > Restart session) and re-run from the `%cd` cell."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import torch\n",
++    "print(torch.__version__, \"| GPU:\", torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none (CPU)\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Quick sanity run (MDM)\n",
++    "Small subset, 3 epochs. Expect low accuracy; the point is checking the whole pipeline works."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "!QUICK=1 bash boxes_mdm/run_boxes.sh"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## Full runs (GPU recommended)\n",
++    "MDM, then the autoregressive baseline. Tune `EPOCHS`, `BS`, `LR`, `T` as needed."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "!MODE=mdm EPOCHS=100 bash boxes_mdm/run_boxes.sh"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "!MODE=ar  EPOCHS=100 bash boxes_mdm/run_boxes.sh"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "Outputs (checkpoints, logs, `scores.txt`) are under `diffusion-vs-ar/output/boxes/`. To keep them, copy that folder to Google Drive."
++   ]
++  }
++ ],
++ "metadata": {
++  "colab": {
++   "provenance": []
++  },
++  "kernelspec": {
++   "name": "python3",
++   "display_name": "Python 3"
++  },
++  "accelerator": "GPU"
++ },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
+\ No newline at end of file
+diff --git a/boxes_mdm/patch_device.py b/boxes_mdm/patch_device.py
+new file mode 100644
+index 0000000..9f82e84
+--- /dev/null
++++ b/boxes_mdm/patch_device.py
+@@ -0,0 +1,34 @@
++# usage: python patch_device.py <path to diffusion-vs-ar>
++# Makes the upstream code run without a GPU (CPU) and on any single CUDA device: replaces hardcoded
++# .cuda() calls with the active device. Idempotent: safe to run more than once.
++import sys
++root = sys.argv[1]
++EDITS = {
++    "src/llmtuner/tuner/mdm/trainer.py": [
++        ("        self.model.cuda()\n", "        self.model.to(self.args.device)\n"),
++        ("        x = inputs['input_ids'].cuda()\n", "        x = inputs['input_ids'].to(self.args.device)\n"),
++        ("        src_mask = inputs['src_mask'].bool().cuda()\n", "        src_mask = inputs['src_mask'].bool().to(self.args.device)\n"),
++    ],
++    "src/llmtuner/tuner/core/loader.py": [
++        ("map_location=torch.device('cuda')", "map_location=torch.device('cpu')"),
++    ],
++    "src/llmtuner/tuner/mdm/workflow.py": [
++        ("        if not dist.is_initialized():\n            dist.init_process_group(backend='nccl')\n",
++         "        if int(__import__('os').environ.get('WORLD_SIZE', '1')) > 1 and not dist.is_initialized():  # only when launched distributed\n"
++         "            dist.init_process_group(backend='nccl')\n"),
++    ],
++    "src/llmtuner/extras/misc.py": [
++        ("        return model.cuda()\n", "        return model.to('cuda' if torch.cuda.is_available() else 'cpu')\n"),
++    ],
++}
++for rel, pairs in EDITS.items():
++    p = f"{root}/{rel}"
++    s = open(p).read()
++    changed = False
++    for old, new in pairs:
++        if new in s:
++            continue
++        assert s.count(old) == 1, f"{rel}: expected exactly one occurrence of {old.strip()!r} (upstream changed?)"
++        s = s.replace(old, new); changed = True
++    open(p, "w").write(s)
++    print(("patched " if changed else "already patched ") + p)
+diff --git a/boxes_mdm/run_boxes.sh b/boxes_mdm/run_boxes.sh
+new file mode 100755
+index 0000000..74578c0
+--- /dev/null
++++ b/boxes_mdm/run_boxes.sh
+@@ -0,0 +1,86 @@
++#!/usr/bin/env bash
++# Portable end-to-end run: data prep (once) -> train -> evaluate -> score.
++# Works on CPU only, one GPU, or several GPUs (auto-detected). Use from a laptop, Colab, or a cluster.
++#
++#   bash boxes_mdm/run_boxes.sh                      # full run (MODE=mdm), settings below
++#   QUICK=1 bash boxes_mdm/run_boxes.sh              # small sanity run (4000 train / 500 test examples, 3 epochs)
++#   MODE=ar bash boxes_mdm/run_boxes.sh              # autoregressive baseline
++#
++# Knobs (env vars): MODE=mdm|ar  EPOCHS  MODEL  LR  BS  T  MAX_TRAIN  MAX_TEST  VAL_SIZE  NGPU  QUICK
++set -euo pipefail
++HERE=$(cd "$(dirname "$0")" && pwd)
++ROOT=$(cd "$HERE/.." && pwd)
++REPO=$ROOT/diffusion-vs-ar
++
++NGPU=${NGPU:-$(python -c "import torch; print(torch.cuda.device_count())")}
++if [ "$NGPU" -ge 1 ]; then DEV="$NGPU GPU(s)"; DEF_BS=128; DEF_EP=100; else DEV="CPU"; DEF_BS=16; DEF_EP=3; fi
++if [ "${QUICK:-0}" = "1" ]; then MAX_TRAIN=${MAX_TRAIN:-4000}; MAX_TEST=${MAX_TEST:-500}; DEF_EP=3; fi
++
++MODE=${MODE:-mdm}; EPOCHS=${EPOCHS:-$DEF_EP}; MODEL=${MODEL:-model_config_tiny_boxes}
++LR=${LR:-1e-3}; BS=${BS:-$DEF_BS}; T=${T:-20}; VAL_SIZE=${VAL_SIZE:-448}
++MAX_TRAIN=${MAX_TRAIN:-}; MAX_TEST=${MAX_TEST:-}
++WORKERS=$(python -c "import os; print(min(8, os.cpu_count() or 1))")
++[ "$MODE" = "mdm" ] || [ "$MODE" = "ar" ] || { echo "MODE must be mdm or ar"; exit 1; }
++echo ">> device: $DEV | mode: $MODE | epochs: $EPOCHS | batch/device: $BS | train cap: ${MAX_TRAIN:-all} | test cap: ${MAX_TEST:-all}"
++
++# 1. one-time setup (needs the submodules); patches are idempotent, so always re-applied
++if [ ! -f "$REPO/src/train_bash.py" ]; then
++    git -C "$ROOT" submodule update --init || { echo "ERROR: run 'git clone --recursive' or 'git submodule update --init'"; exit 1; }
++fi
++[ -f "$REPO/data/boxes_lengths.json" ] || bash "$HERE/setup_boxes.sh"
++python "$HERE/patch_metric.py" "$REPO" >/dev/null
++python "$HERE/patch_device.py" "$REPO" >/dev/null
++mkdir -p "$REPO/scripts/boxes"; cp "$HERE"/scripts_boxes/score_boxes.py "$REPO/scripts/boxes/"
++
++cd "$REPO"
++export WANDB_DISABLED=true
++CUT=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['cutoff_len'])")
++NEW=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['max_new_tokens'])")
++exp=output/boxes/$MODE-bs$BS-lr$LR-ep$EPOCHS-$(date +%Y%m%d-%H%M%S)
++mkdir -p "$exp"
++
++STAGE=$([ "$MODE" = "mdm" ] && echo mdm || echo sft)
++MDM_TRAIN=(); MDM_EVAL=(); AR_EVAL=()
++if [ "$MODE" = "mdm" ]; then
++    MDM_TRAIN=(--diffusion_steps "$T" --save_safetensors False --token_reweighting True --time_reweighting linear --topk_decoding True --alpha 0.25 --gamma 1)
++    MDM_EVAL=(--diffusion_steps "$T" --topk_decoding True --decoding_strategy stochastic0.5-linear)
++else
++    AR_EVAL=(--predict_with_generate --max_new_tokens "$NEW")
++fi
++
++# launcher: plain python on CPU / 1 GPU, accelerate for several GPUs
++if [ "$NGPU" -gt 1 ]; then
++    LAUNCH=(accelerate launch --multi_gpu --num_machines 1 --mixed_precision fp16 --num_processes "$NGPU" --main_process_port "${PORT:-20099}")
++else
++    LAUNCH=(python)
++fi
++FP16=(); [ "$NGPU" -ge 1 ] && FP16=(--fp16)
++CAP_TRAIN=(); [ -n "$MAX_TRAIN" ] && CAP_TRAIN=(--max_samples "$MAX_TRAIN")
++CAP_TEST=();  [ -n "$MAX_TEST" ]  && CAP_TEST=(--max_samples "$MAX_TEST")
++
++echo ">> training (log: $exp/train.log)"
++"${LAUNCH[@]}" src/train_bash.py --stage "$STAGE" --overwrite_output_dir --cache_dir ./cache \
++    --model_name_or_path "$MODEL" --do_train --dataset boxes_train --finetuning_type full \
++    --cutoff_len "$CUT" --output_dir "$exp" --overwrite_cache \
++    --per_device_train_batch_size "$BS" --gradient_accumulation_steps 1 --lr_scheduler_type cosine \
++    --logging_steps 1 --val_size "$VAL_SIZE" --per_device_eval_batch_size 32 \
++    --evaluation_strategy steps --eval_steps "${EVAL_STEPS:-100}" --save_steps "${SAVE_STEPS:-500}" \
++    --learning_rate "$LR" --num_train_epochs "$EPOCHS" --plot_loss --run_name "boxes_$MODE" \
++    --preprocessing_num_workers "$WORKERS" --save_total_limit 1 --remove_unused_columns False \
++    "${FP16[@]}" "${MDM_TRAIN[@]}" "${CAP_TRAIN[@]}" > "$exp/train.log" 2>&1 \
++    || { echo "TRAINING FAILED, last lines of $exp/train.log:"; tail -25 "$exp/train.log"; exit 1; }
++
++echo ">> evaluating on boxes_test (log: $exp/boxes_test/eval.log)"
++mkdir -p "$exp/boxes_test"
++CUDA_VISIBLE_DEVICES=$([ "$NGPU" -ge 1 ] && echo 0 || echo "") \
++python -u src/train_bash.py --stage "$STAGE" --overwrite_output_dir --cache_dir ./cache \
++    --model_name_or_path "$MODEL" --do_predict --cutoff_len "$CUT" --dataset boxes_test \
++    --finetuning_type full --output_dir "$exp/boxes_test" --checkpoint_dir "$exp" \
++    --per_device_eval_batch_size "${EVAL_BS:-$([ "$NGPU" -ge 1 ] && echo 128 || echo 32)}" --remove_unused_columns False \
++    "${MDM_EVAL[@]}" "${AR_EVAL[@]}" "${CAP_TEST[@]}" > "$exp/boxes_test/eval.log" 2>&1 \
++    || { echo "EVAL FAILED, last lines of $exp/boxes_test/eval.log:"; tail -25 "$exp/boxes_test/eval.log"; exit 1; }
++
++echo ">> scores"
++python scripts/boxes/score_boxes.py --pred "$exp/boxes_test/generated_predictions.jsonl" \
++    --meta data/boxes_test.meta.jsonl --truncate | tee "$exp/scores.txt"
++echo "outputs in $REPO/$exp"
+diff --git a/boxes_mdm/scripts_boxes/score_boxes.py b/boxes_mdm/scripts_boxes/score_boxes.py
+index 96d0c6b..13b9699 100644
+--- a/boxes_mdm/scripts_boxes/score_boxes.py
++++ b/boxes_mdm/scripts_boxes/score_boxes.py
+@@ -7,6 +7,7 @@ ap = argparse.ArgumentParser()
+ ap.add_argument("--pred", required=True)
+ ap.add_argument("--meta", required=True)
+ ap.add_argument("--tsv", default=None)
++ap.add_argument("--truncate", action="store_true", help="use the first len(pred) meta rows (when run with --max_samples)")
+ a = ap.parse_args()
+ 
+ def items(x):
+@@ -17,6 +18,7 @@ def items(x):
+ 
+ preds = [json.loads(l) for l in open(a.pred) if l.strip()]
+ meta = [json.loads(l) for l in open(a.meta) if l.strip()]
++if a.truncate: meta = meta[:len(preds)]
+ assert len(preds) == len(meta), f"{len(preds)} preds vs {len(meta)} meta (use --max_samples consistently)"
+ tot, cor = collections.Counter(), collections.Counter()
+ rows = []
+diff --git a/boxes_mdm/scripts_boxes/train-mdm.sh b/boxes_mdm/scripts_boxes/train-mdm.sh
+deleted file mode 100644
+index da7f886..0000000
+--- a/boxes_mdm/scripts_boxes/train-mdm.sh
++++ /dev/null
+@@ -1,72 +0,0 @@
+-# usage: NGPU=8 EPOCHS=100 MODEL=model_config_tiny_boxes LR=1e-3 bash scripts/boxes/train-mdm.sh
+-set -e
+-export WANDB_DISABLED=true
+-NGPU=${NGPU:-8}; EPOCHS=${EPOCHS:-100}; MODEL=${MODEL:-model_config_tiny_boxes}; LR=${LR:-1e-3}
+-BS=${BS:-128}; T=${T:-20}
+-CUT=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['cutoff_len'])")
+-GPUS=$(seq -s, 0 $((NGPU-1)))
+-MG=""; [ "$NGPU" -gt 1 ] && MG="--multi_gpu"   # --multi_gpu with a single process can fail
+-
+-exp=output/boxes/mdm-alpha0.25-gamma1-bs$((BS*NGPU))-lr$LR-ep$EPOCHS-T$T-`date "+%Y%m%d-%H%M%S"`
+-mkdir -p $exp
+-
+-CUDA_VISIBLE_DEVICES=$GPUS \
+-accelerate launch $MG --num_machines 1 --mixed_precision fp16 --num_processes $NGPU --main_process_port 20099 \
+-src/train_bash.py \
+-    --stage mdm --overwrite_output_dir \
+-    --cache_dir ./cache \
+-    --model_name_or_path $MODEL \
+-    --do_train \
+-    --dataset boxes_train \
+-    --finetuning_type full \
+-    --cutoff_len $CUT \
+-    --output_dir $exp \
+-    --overwrite_cache \
+-    --per_device_train_batch_size $BS \
+-    --gradient_accumulation_steps 1 \
+-    --lr_scheduler_type cosine \
+-    --logging_steps 1 \
+-    --val_size 448 \
+-    --per_device_eval_batch_size 32 \
+-    --evaluation_strategy steps \
+-    --eval_steps 100 \
+-    --save_steps 500 \
+-    --learning_rate $LR \
+-    --num_train_epochs $EPOCHS \
+-    --plot_loss \
+-    --run_name boxes_mdm \
+-    --preprocessing_num_workers 8 \
+-    --fp16 \
+-    --save_total_limit 1 \
+-    --remove_unused_columns False \
+-    --diffusion_steps $T \
+-    --save_safetensors False \
+-    --token_reweighting True \
+-    --time_reweighting linear \
+-    --topk_decoding True \
+-    --alpha 0.25 \
+-    --gamma 1 \
+-    > $exp/train.log
+-
+-for dataset in boxes_test
+-do
+-mkdir -p $exp/$dataset
+-CUDA_VISIBLE_DEVICES=0 \
+-python3 -u src/train_bash.py \
+-    --stage mdm --overwrite_output_dir \
+-    --cache_dir ./cache \
+-    --model_name_or_path $MODEL \
+-    --do_predict \
+-    --cutoff_len $CUT \
+-    --dataset $dataset \
+-    --finetuning_type full \
+-    --diffusion_steps $T \
+-    --output_dir $exp/${dataset} \
+-    --checkpoint_dir $exp \
+-    --per_device_eval_batch_size 128 \
+-    --remove_unused_columns False \
+-    --decoding_strategy stochastic0.5-linear \
+-    --topk_decoding True \
+-    > $exp/${dataset}/eval.log
+-python scripts/boxes/score_boxes.py --pred $exp/$dataset/generated_predictions.jsonl --meta data/boxes_test.meta.jsonl
+-done
+diff --git a/boxes_mdm/scripts_boxes/train-sft.sh b/boxes_mdm/scripts_boxes/train-sft.sh
+deleted file mode 100644
+index 1ca1e16..0000000
+--- a/boxes_mdm/scripts_boxes/train-sft.sh
++++ /dev/null
+@@ -1,62 +0,0 @@
+-# AR baseline. usage: NGPU=8 EPOCHS=100 MODEL=model_config_tiny_boxes LR=1e-3 bash scripts/boxes/train-sft.sh
+-set -e
+-export WANDB_DISABLED=true
+-NGPU=${NGPU:-8}; EPOCHS=${EPOCHS:-100}; MODEL=${MODEL:-model_config_tiny_boxes}; LR=${LR:-1e-3}; BS=${BS:-128}
+-CUT=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['cutoff_len'])")
+-NEW=$(python -c "import json;print(json.load(open('data/boxes_lengths.json'))['max_new_tokens'])")
+-GPUS=$(seq -s, 0 $((NGPU-1)))
+-MG=""; [ "$NGPU" -gt 1 ] && MG="--multi_gpu"   # --multi_gpu with a single process can fail
+-
+-exp=output/boxes/ar-bs$((BS*NGPU))-lr$LR-ep$EPOCHS-`date "+%Y%m%d-%H%M%S"`
+-mkdir -p $exp
+-
+-CUDA_VISIBLE_DEVICES=$GPUS \
+-accelerate launch $MG --num_machines 1 --mixed_precision fp16 --num_processes $NGPU \
+-src/train_bash.py \
+-    --stage sft --overwrite_output_dir \
+-    --cache_dir ./cache \
+-    --model_name_or_path $MODEL \
+-    --do_train \
+-    --dataset boxes_train \
+-    --finetuning_type full \
+-    --cutoff_len $CUT \
+-    --output_dir $exp \
+-    --overwrite_cache \
+-    --per_device_train_batch_size $BS \
+-    --gradient_accumulation_steps 1 \
+-    --lr_scheduler_type cosine \
+-    --logging_steps 1 \
+-    --val_size 448 \
+-    --per_device_eval_batch_size 32 \
+-    --evaluation_strategy steps \
+-    --eval_steps 100 \
+-    --save_steps 500 \
+-    --learning_rate $LR \
+-    --num_train_epochs $EPOCHS \
+-    --plot_loss \
+-    --run_name boxes_ar \
+-    --preprocessing_num_workers 8 \
+-    --fp16 \
+-    --save_total_limit 1 \
+-    > $exp/train.log
+-
+-for dataset in boxes_test
+-do
+-mkdir -p $exp/$dataset
+-CUDA_VISIBLE_DEVICES=0 \
+-python3 -u src/train_bash.py \
+-    --stage sft --overwrite_output_dir \
+-    --cache_dir ./cache \
+-    --model_name_or_path $MODEL \
+-    --do_predict \
+-    --cutoff_len $CUT \
+-    --per_device_eval_batch_size 128 \
+-    --dataset $dataset \
+-    --finetuning_type full \
+-    --output_dir $exp/${dataset} \
+-    --checkpoint_dir $exp \
+-    --predict_with_generate \
+-    --max_new_tokens $NEW \
+-    > $exp/${dataset}/eval.log
+-python scripts/boxes/score_boxes.py --pred $exp/$dataset/generated_predictions.jsonl --meta data/boxes_test.meta.jsonl
+-done
+diff --git a/boxes_mdm/setup_boxes.sh b/boxes_mdm/setup_boxes.sh
+index d5c8092..952a241 100755
+--- a/boxes_mdm/setup_boxes.sh
++++ b/boxes_mdm/setup_boxes.sh
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env bash
+ # usage: bash boxes_mdm/setup_boxes.sh [REPO] [KS_REPO] [SPLIT]
+ # Defaults: the diffusion-vs-ar / entity-tracking-lms submodules next to boxes_mdm/.
+-# Needs: submodules checked out (git submodule update --init), `unzip`, and the project venv
+-# active (prep_boxes.py imports transformers). The Google Drive data from the diffusion-vs-ar
++# Needs: submodules checked out (git submodule update --init), `unzip`, and the Python deps
++# installed (pip install -r requirements.txt; prep_boxes.py imports transformers). The Google Drive data from the diffusion-vs-ar
+ # README is NOT needed for boxes: prep_boxes.py creates data/dataset_info.json itself.
+ set -euo pipefail
+ HERE=$(cd "$(dirname "$0")" && pwd)
+@@ -12,12 +12,13 @@ REPO=${1:-$ROOT/diffusion-vs-ar}; KS=${2:-$ROOT/entity-tracking-lms}; SPLIT=${3:
+ [ -f "$REPO/src/train_bash.py" ] || { echo "ERROR: $REPO is empty/not diffusion-vs-ar. Run: git submodule update --init"; exit 1; }
+ [ -f "$KS/data/boxes-dataset-v1.zip" ] || { echo "ERROR: $KS/data/boxes-dataset-v1.zip missing. Run: git submodule update --init"; exit 1; }
+ command -v unzip >/dev/null || { echo "ERROR: unzip not found"; exit 1; }
+-python -c "import transformers" 2>/dev/null || { echo "ERROR: transformers not importable; activate the venv (see make_env.sh)"; exit 1; }
++python -c "import transformers" 2>/dev/null || { echo "ERROR: transformers not importable; run: pip install -r requirements.txt"; exit 1; }
+ 
+ TMP=${TMPDIR:-/tmp}/boxes_$(id -un); mkdir -p "$TMP"   # keep unzipped data OUT of any git repo (authors' request)
+ unzip -oq -P iamnotaLM "$KS/data/boxes-dataset-v1.zip" -d "$TMP"
+ python "$HERE/prep_boxes.py" --boxes_dir "$TMP/boxes-dataset-v1" --repo "$REPO" --split "$SPLIT"
+ python "$HERE/patch_metric.py" "$REPO"
++python "$HERE/patch_device.py" "$REPO"   # lets the code run on CPU / any single device
+ mkdir -p "$REPO/scripts/boxes"
+ cp "$HERE"/scripts_boxes/* "$REPO/scripts/boxes/"
+-echo "ready. smoke test:  cd $REPO && NGPU=1 EPOCHS=2 bash scripts/boxes/train-mdm.sh"
++echo "ready. try:  QUICK=1 bash boxes_mdm/run_boxes.sh"
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..0f8e033
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,9 @@
++# Portable requirements (laptop / Colab / cluster). Install torch for your hardware first if you need a
++# specific CUDA build (https://pytorch.org/get-started/locally/); Colab already has a GPU build.
++# Tested: Python 3.11, torch 2.14 (CPU), numpy 2.2. The pins below are the versions the upstream code expects.
++torch
++transformers==4.37.2
++accelerate==0.27.2
++datasets==2.14.7
++peft==0.6.0
++matplotlib
+-- 
+2.43.0
