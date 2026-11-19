@@ -1,0 +1,7 @@
+host=gpu20-2.drl.csail.mit.edu  CUDA_VISIBLE_DEVICES=[0]  SLURM_GPUS_PER_TASK=[unset]
+--- before env.sh ---
+No devices found.
+--- after env.sh ---  CUDA_VISIBLE_DEVICES=[0]
+No devices found.
+1.13.1+cu117 cuda available: False count: 0
+NO GPU VISIBLE - stopping
